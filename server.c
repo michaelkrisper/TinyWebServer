@@ -29,6 +29,7 @@ void get_exe_dir(const char *argv0, char *dir, size_t size) {
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -135,7 +136,12 @@ void handle_client(SOCKET client) {
            "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
            mime_type(local_path), (unsigned long)bytes_read);
   send(client, header, (int)strlen(header), 0);
-  send(client, data, (int)bytes_read, 0);
+  size_t sent = 0;
+  while (sent < bytes_read) {
+    int n = send(client, data + sent, (int)(bytes_read - sent), 0);
+    if (n <= 0) break;
+    sent += (size_t)n;
+  }
   free(data);
   closesocket(client);
 }
@@ -170,8 +176,10 @@ int main(int argc, char *argv[]) {
       return 1;
     }
   }
-  if (argc >= 3)
+  if (argc >= 3) {
     strncpy(serve_dir, argv[2], sizeof(serve_dir) - 1);
+    serve_dir[sizeof(serve_dir) - 1] = '\0';
+  }
 
   if (os_chdir(serve_dir) != 0) {
     printf("Failed to change to directory: %s\n", serve_dir);
