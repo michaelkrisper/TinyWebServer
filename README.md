@@ -7,6 +7,7 @@ A minimalist static file server written in C. Files are read from disk on every 
 
 ## Features
 - **Any file type**: Serves HTML, CSS, JS, images, fonts, video, audio, ZIP, and more (20+ MIME types)
+- **mtime cache**: Files are cached in memory and reloaded only when modified (up to 64 entries)
 - **CLI arguments**: Configurable port and serve directory
 - **Thread-per-connection**: Each request is handled in a short-lived detached thread
 - **Directory traversal protection**: `..` in paths returns 403
@@ -38,14 +39,14 @@ make
 
 ## Benchmarks
 
-Load test using [Bombardier](https://github.com/codesenberg/bombardier) v1.2.6 — 100 concurrent connections, 10 seconds, Windows (v3.0 release binary, files read from disk):
+Load test using [Bombardier](https://github.com/codesenberg/bombardier) v1.2.6 — 100 concurrent connections, 10 seconds, Windows (v3.1 release binary):
 
 | Endpoint      | Req/sec | Latency avg | p50     | p99     |
 |---------------|---------|-------------|---------|---------|
-| `/`           | ~327    | 320 ms      | 318 ms  | 384 ms  |
-| `/index.html` | ~316    | 320 ms      | 318 ms  | 354 ms  |
+| `/`           | ~312    | 319 ms      | 318 ms  | 368 ms  |
+| `/index.html` | ~306    | 320 ms      | 318 ms  | 350 ms  |
 
-*Performance is higher on Linux due to lower thread-creation overhead. The old cached version reached ~3,380 RPS; the tradeoff is simplicity and support for any file type.*
+*Bottleneck on Windows is thread-creation overhead, not disk I/O — the mtime cache avoids redundant reads but doesn't change the concurrency profile. Performance is higher on Linux.*
 
 ### Running the benchmark yourself
 ```bash
