@@ -8,6 +8,8 @@
 #define MAX_REQ       2048
 #define MAX_FILE_SIZE (10 * 1024 * 1024)
 #define CACHE_CAP     64
+#define POOL_SIZE     32
+#define QUEUE_CAP     256
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
@@ -35,6 +37,16 @@ static SRWLOCK g_lock;
 #define cache_runlock()   ReleaseSRWLockShared(&g_lock)
 #define cache_wlock()     AcquireSRWLockExclusive(&g_lock)
 #define cache_wunlock()   ReleaseSRWLockExclusive(&g_lock)
+
+static CRITICAL_SECTION  g_queue_mutex;
+static CONDITION_VARIABLE g_queue_cond;
+#define queue_mutex_init() InitializeCriticalSection(&g_queue_mutex)
+#define queue_lock()       EnterCriticalSection(&g_queue_mutex)
+#define queue_unlock()     LeaveCriticalSection(&g_queue_mutex)
+#define queue_wait()       SleepConditionVariableCS(&g_queue_cond, &g_queue_mutex, INFINITE)
+#define queue_signal()     WakeConditionVariable(&g_queue_cond)
+#define THREAD_RET         DWORD WINAPI
+#define THREAD_RET_VAL     0
 
 #else
 #include <arpa/inet.h>
@@ -71,6 +83,16 @@ static pthread_rwlock_t g_lock = PTHREAD_RWLOCK_INITIALIZER;
 #define cache_runlock()   pthread_rwlock_unlock(&g_lock)
 #define cache_wlock()     pthread_rwlock_wrlock(&g_lock)
 #define cache_wunlock()   pthread_rwlock_unlock(&g_lock)
+
+static pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_queue_cond  = PTHREAD_COND_INITIALIZER;
+#define queue_mutex_init() ((void)0)
+#define queue_lock()       pthread_mutex_lock(&g_queue_mutex)
+#define queue_unlock()     pthread_mutex_unlock(&g_queue_mutex)
+#define queue_wait()       pthread_cond_wait(&g_queue_cond, &g_queue_mutex)
+#define queue_signal()     pthread_cond_signal(&g_queue_cond)
+#define THREAD_RET         void *
+#define THREAD_RET_VAL     NULL
 #endif
 
 typedef struct {
@@ -200,23 +222,46 @@ void handle_client(SOCKET client) {
   closesocket(client);
 }
 
+static SOCKET g_queue[QUEUE_CAP];
+static int    g_queue_head, g_queue_tail, g_queue_len;
+
+static THREAD_RET worker_thread(void *_) {
+  (void)_;
+  for (;;) {
+    queue_lock();
+    while (g_queue_len == 0) queue_wait();
+    SOCKET s = g_queue[g_queue_head];
+    g_queue_head = (g_queue_head + 1) % QUEUE_CAP;
+    g_queue_len--;
+    queue_unlock();
+    handle_client(s);
+  }
+  return THREAD_RET_VAL;
+}
+
+static void start_pool(void) {
+  queue_mutex_init();
+  for (int i = 0; i < POOL_SIZE; i++) {
 #ifdef _WIN32
-DWORD WINAPI thread_entry(LPVOID arg) { handle_client((SOCKET)(intptr_t)arg); return 0; }
-void spawn_thread(SOCKET client) {
-  HANDLE t = CreateThread(NULL, 0, thread_entry, (void *)(intptr_t)client, 0, NULL);
-  if (t) CloseHandle(t);
-  else closesocket(client);
-}
+    CloseHandle(CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)worker_thread, NULL, 0, NULL));
 #else
-void *thread_entry(void *arg) { handle_client((SOCKET)(intptr_t)arg); return NULL; }
-void spawn_thread(SOCKET client) {
-  pthread_t t;
-  if (pthread_create(&t, NULL, thread_entry, (void *)(intptr_t)client) == 0)
-    pthread_detach(t);
-  else
-    closesocket(client);
-}
+    pthread_t t; pthread_create(&t, NULL, worker_thread, NULL); pthread_detach(t);
 #endif
+  }
+}
+
+static void enqueue_client(SOCKET s) {
+  queue_lock();
+  if (g_queue_len < QUEUE_CAP) {
+    g_queue[g_queue_tail] = s;
+    g_queue_tail = (g_queue_tail + 1) % QUEUE_CAP;
+    g_queue_len++;
+    queue_signal();
+  } else {
+    closesocket(s); /* queue full, reject */
+  }
+  queue_unlock();
+}
 
 int main(int argc, char *argv[]) {
   int port = DEFAULT_PORT;
@@ -236,6 +281,7 @@ int main(int argc, char *argv[]) {
   }
 
   cache_lock_init();
+  start_pool();
 
   if (os_chdir(serve_dir) != 0) {
     printf("Failed to change to directory: %s\n", serve_dir);
@@ -274,6 +320,6 @@ int main(int argc, char *argv[]) {
   while (1) {
     SOCKET client = accept(server, NULL, NULL);
     if (client != INVALID_SOCKET)
-      spawn_thread(client);
+      enqueue_client(client);
   }
 }
