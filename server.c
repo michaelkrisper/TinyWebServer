@@ -49,11 +49,20 @@ static CONDITION_VARIABLE g_queue_cond;
 #define THREAD_RET         DWORD WINAPI
 #define THREAD_RET_VAL     0
 
+/* Atomic timestamp: relaxed store/load, no write-lock upgrade needed */
+typedef volatile LONG64 atomic_time_t;
+static inline void atomic_time_store(atomic_time_t *p, time_t v) {
+  InterlockedExchange64((LONGLONG volatile *)p, (LONGLONG)v);
+}
+static inline time_t atomic_time_load(const atomic_time_t *p) { return (time_t)*p; }
+
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -94,6 +103,14 @@ static pthread_cond_t  g_queue_cond  = PTHREAD_COND_INITIALIZER;
 #define queue_signal()     pthread_cond_signal(&g_queue_cond)
 #define THREAD_RET         void *
 #define THREAD_RET_VAL     NULL
+
+typedef _Atomic time_t atomic_time_t;
+static inline void atomic_time_store(atomic_time_t *p, time_t v) {
+  atomic_store_explicit(p, v, memory_order_relaxed);
+}
+static inline time_t atomic_time_load(const atomic_time_t *p) {
+  return atomic_load_explicit(p, memory_order_relaxed);
+}
 #endif
 
 typedef struct {
@@ -101,7 +118,11 @@ typedef struct {
   char  *data;
   size_t size;
   time_t mtime;
-  time_t last_checked;
+  atomic_time_t last_checked;
+  char   header_ka[256];  /* pre-built "Connection: keep-alive" header */
+  int    header_ka_len;
+  char   header_cl[256];  /* pre-built "Connection: close" header */
+  int    header_cl_len;
 } CacheEntry;
 
 static CacheEntry g_cache[CACHE_CAP];
@@ -109,13 +130,9 @@ static int        g_cache_n;
 
 const char *mime_type(const char *path);
 
-static void send_response(SOCKET client, const char *data, size_t size,
-                           const char *path, int keep_alive) {
-  char header[256];
-  snprintf(header, sizeof(header),
-    "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: %s\r\n\r\n",
-    mime_type(path), (unsigned long)size, keep_alive ? "keep-alive" : "close");
-  send(client, header, (int)strlen(header), 0);
+static void send_response(SOCKET client, const char *header, int header_len,
+                           const char *data, size_t size) {
+  send(client, header, header_len, 0);
   size_t sent = 0;
   while (sent < size) {
     int n = send(client, data + sent, (int)(size - sent), 0);
@@ -131,9 +148,13 @@ static int cache_serve(const char *path, SOCKET client, int keep_alive) {
   /* Fast path: entry is fresh — skip stat, send under read lock (no copy) */
   cache_rlock();
   for (int i = 0; i < g_cache_n; i++) {
-    if (strcmp(g_cache[i].path, path) == 0 &&
-        now - g_cache[i].last_checked < MTIME_CHECK_INTERVAL) {
-      send_response(client, g_cache[i].data, g_cache[i].size, path, keep_alive);
+    CacheEntry *e = &g_cache[i];
+    if (strcmp(e->path, path) == 0 &&
+        now - atomic_time_load(&e->last_checked) < MTIME_CHECK_INTERVAL) {
+      send_response(client,
+                    keep_alive ? e->header_ka : e->header_cl,
+                    keep_alive ? e->header_ka_len : e->header_cl_len,
+                    e->data, e->size);
       cache_runlock();
       return 1;
     }
@@ -145,16 +166,17 @@ static int cache_serve(const char *path, SOCKET client, int keep_alive) {
   if (os_stat(path, &st) != 0) return 0;
   if (st.st_size <= 0 || st.st_size > MAX_FILE_SIZE) return 0;
 
-  /* Cached entry still valid (same mtime)? Send and refresh last_checked. */
+  /* Cached entry still valid (same mtime)? Send and refresh last_checked atomically. */
   cache_rlock();
   for (int i = 0; i < g_cache_n; i++) {
-    if (strcmp(g_cache[i].path, path) == 0 && g_cache[i].mtime == st.st_mtime) {
-      send_response(client, g_cache[i].data, g_cache[i].size, path, keep_alive);
+    CacheEntry *e = &g_cache[i];
+    if (strcmp(e->path, path) == 0 && e->mtime == st.st_mtime) {
+      send_response(client,
+                    keep_alive ? e->header_ka : e->header_cl,
+                    keep_alive ? e->header_ka_len : e->header_cl_len,
+                    e->data, e->size);
+      atomic_time_store(&e->last_checked, now);  /* no write-lock upgrade needed */
       cache_runlock();
-      cache_wlock();
-      for (int j = 0; j < g_cache_n; j++)
-        if (strcmp(g_cache[j].path, path) == 0) { g_cache[j].last_checked = now; break; }
-      cache_wunlock();
       return 1;
     }
   }
@@ -168,7 +190,17 @@ static int cache_serve(const char *path, SOCKET client, int keep_alive) {
   size_t n = fread(data, 1, (size_t)st.st_size, f);
   fclose(f);
 
-  send_response(client, data, n, path, keep_alive);
+  /* Pre-build both header variants */
+  char hdr_ka[256], hdr_cl[256];
+  int hdr_ka_len = snprintf(hdr_ka, sizeof(hdr_ka),
+    "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: keep-alive\r\n\r\n",
+    mime_type(path), (unsigned long)n);
+  int hdr_cl_len = snprintf(hdr_cl, sizeof(hdr_cl),
+    "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
+    mime_type(path), (unsigned long)n);
+
+  send_response(client, keep_alive ? hdr_ka : hdr_cl,
+                         keep_alive ? hdr_ka_len : hdr_cl_len, data, n);
 
   cache_wlock();
   int slot = g_cache_n < CACHE_CAP ? g_cache_n++ : 0;
@@ -176,10 +208,15 @@ static int cache_serve(const char *path, SOCKET client, int keep_alive) {
     if (strcmp(g_cache[i].path, path) == 0) { slot = i; break; }
   free(g_cache[slot].data);
   strncpy(g_cache[slot].path, path, sizeof(g_cache[slot].path) - 1);
+  g_cache[slot].path[sizeof(g_cache[slot].path) - 1] = '\0';
   g_cache[slot].data         = data;
   g_cache[slot].size         = n;
   g_cache[slot].mtime        = st.st_mtime;
-  g_cache[slot].last_checked = now;
+  atomic_time_store(&g_cache[slot].last_checked, now);
+  memcpy(g_cache[slot].header_ka, hdr_ka, (size_t)hdr_ka_len);
+  g_cache[slot].header_ka_len = hdr_ka_len;
+  memcpy(g_cache[slot].header_cl, hdr_cl, (size_t)hdr_cl_len);
+  g_cache[slot].header_cl_len = hdr_cl_len;
   cache_wunlock();
   return 1;
 }
@@ -214,11 +251,14 @@ void handle_client(SOCKET client) {
   struct timeval tv = {5, 0};
 #endif
   setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+  int nodelay = 1;
+  setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
 
   char buffer[MAX_REQ];
   for (;;) {
-    memset(buffer, 0, sizeof(buffer));
-    if (recv(client, buffer, sizeof(buffer) - 1, 0) <= 0) break;
+    int nr = recv(client, buffer, sizeof(buffer) - 1, 0);
+    if (nr <= 0) break;
+    buffer[nr] = '\0';
 
     if (strncmp(buffer, "GET ", 4) != 0) {
       send(client, "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\nMethod Not Allowed", 73, 0);
