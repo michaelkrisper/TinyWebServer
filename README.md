@@ -3,13 +3,15 @@
 ![Build and Release](https://github.com/michaelkrisper/TinyWebServer/actions/workflows/release.yml/badge.svg)
 ![Build Verification](https://github.com/michaelkrisper/TinyWebServer/actions/workflows/test.yml/badge.svg)
 
-A minimalist static file server written in C. Files are read from disk on every request — no caching, no global state.
+A minimalist static file server written in C.
 
 ## Features
 - **Any file type**: Serves HTML, CSS, JS, images, fonts, video, audio, ZIP, and more (20+ MIME types)
-- **mtime cache**: Files are cached in memory and reloaded only when modified (up to 64 entries)
-- **CLI arguments**: Configurable port and serve directory
-- **Thread pool**: 32 pre-created worker threads, ring-buffer queue (256 slots) — no per-request thread creation
+- **HTTP keep-alive**: connections are reused across requests — no TCP handshake per request
+- **mtime cache**: files cached in memory, reloaded only on change (up to 64 entries, 1s re-check interval)
+- **Zero-copy cache hits**: serves directly from cached buffer under read lock — no malloc/memcpy per request
+- **Thread pool**: 32 pre-created workers, ring-buffer queue (256 slots) — no per-request thread creation
+- **CLI arguments**: configurable port and serve directory
 - **Directory traversal protection**: `..` in paths returns 403
 - **Small footprint**: ~12 KB binary (Windows)
 - **Cross-platform**: Windows (MSVC/GCC/Clang) and Linux/macOS (GCC)
@@ -39,14 +41,14 @@ make
 
 ## Benchmarks
 
-Load test using [Bombardier](https://github.com/codesenberg/bombardier) v1.2.6 — 100 concurrent connections, 10 seconds, Windows (v3.2 release binary):
+Load test using [Bombardier](https://github.com/codesenberg/bombardier) v1.2.6 — 100 concurrent connections, 10 seconds, Windows (v3.3 release binary):
 
-| Endpoint      | Req/sec | Latency avg | p50     | p99     |
-|---------------|---------|-------------|---------|---------|
-| `/`           | ~338    | 318 ms      | 317 ms  | 345 ms  |
-| `/index.html` | ~329    | 319 ms      | 317 ms  | 381 ms  |
+| Endpoint      | Req/sec  | Latency avg | p50      | p99     | Throughput  |
+|---------------|----------|-------------|----------|---------|-------------|
+| `/`           | ~40,700  | 2.5 ms      | 0.57 ms  | 5.9 ms  | 118 MB/s    |
+| `/index.html` | ~42,700  | 2.4 ms      | 0.55 ms  | 6.2 ms  | 125 MB/s    |
 
-*Thread pool (v3.2) improved throughput ~8% and tightened p99 vs. thread-per-connection (v3.1). Performance is higher on Linux.*
+**120× improvement over v3.2** (338 → 40,700 RPS). The bottleneck was TCP connection setup/teardown per request — keep-alive eliminated it. Zero-copy cache serving and skipping `stat()` on fresh entries removed the remaining per-request overhead.
 
 ### Running the benchmark yourself
 ```bash
