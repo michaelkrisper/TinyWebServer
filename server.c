@@ -1,10 +1,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <time.h>
 
-#define DEFAULT_PORT 80
-#define MAX_REQ 2048
+#define DEFAULT_PORT  80
+#define MAX_REQ       2048
 #define MAX_FILE_SIZE (10 * 1024 * 1024)
+#define CACHE_CAP     64
 
 #ifdef _WIN32
 #define _CRT_SECURE_NO_WARNINGS
@@ -13,7 +16,9 @@
 #include <windows.h>
 #include <winsock2.h>
 #pragma comment(lib, "ws2_32.lib")
-#define os_chdir _chdir
+#define os_chdir    _chdir
+#define os_stat_t   struct _stat
+#define os_stat     _stat
 
 void get_exe_dir(const char *argv0, char *dir, size_t size) {
   (void)argv0;
@@ -24,6 +29,13 @@ void get_exe_dir(const char *argv0, char *dir, size_t size) {
   else { dir[0] = '.'; dir[1] = '\0'; }
 }
 
+static SRWLOCK g_lock;
+#define cache_lock_init() InitializeSRWLock(&g_lock)
+#define cache_rlock()     AcquireSRWLockShared(&g_lock)
+#define cache_runlock()   ReleaseSRWLockShared(&g_lock)
+#define cache_wlock()     AcquireSRWLockExclusive(&g_lock)
+#define cache_wunlock()   ReleaseSRWLockExclusive(&g_lock)
+
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -32,12 +44,13 @@ void get_exe_dir(const char *argv0, char *dir, size_t size) {
 #include <stdint.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-#define SOCKET int
+#define SOCKET         int
 #define INVALID_SOCKET (-1)
-#define SOCKET_ERROR (-1)
+#define SOCKET_ERROR   (-1)
 #define closesocket(s) close(s)
-#define os_chdir chdir
+#define os_chdir       chdir
+#define os_stat_t      struct stat
+#define os_stat        stat
 
 void get_exe_dir(const char *argv0, char *dir, size_t size) {
   strncpy(dir, argv0, size - 1);
@@ -51,7 +64,65 @@ static int fopen_s(FILE **f, const char *name, const char *mode) {
   *f = fopen(name, mode);
   return *f ? 0 : -1;
 }
+
+static pthread_rwlock_t g_lock = PTHREAD_RWLOCK_INITIALIZER;
+#define cache_lock_init() ((void)0)
+#define cache_rlock()     pthread_rwlock_rdlock(&g_lock)
+#define cache_runlock()   pthread_rwlock_unlock(&g_lock)
+#define cache_wlock()     pthread_rwlock_wrlock(&g_lock)
+#define cache_wunlock()   pthread_rwlock_unlock(&g_lock)
 #endif
+
+typedef struct {
+  char   path[256];
+  char  *data;
+  size_t size;
+  time_t mtime;
+} CacheEntry;
+
+static CacheEntry g_cache[CACHE_CAP];
+static int        g_cache_n;
+
+/* Returns a malloc'd copy of the file data, or NULL on error. */
+static char *cache_get(const char *path, size_t *out_size) {
+  os_stat_t st;
+  if (os_stat(path, &st) != 0) return NULL;
+  if (st.st_size <= 0 || st.st_size > MAX_FILE_SIZE) return NULL;
+  time_t mtime = st.st_mtime;
+
+  cache_rlock();
+  for (int i = 0; i < g_cache_n; i++) {
+    if (strcmp(g_cache[i].path, path) == 0 && g_cache[i].mtime == mtime) {
+      char *copy = malloc(g_cache[i].size);
+      if (copy) { memcpy(copy, g_cache[i].data, g_cache[i].size); *out_size = g_cache[i].size; }
+      cache_runlock();
+      return copy;
+    }
+  }
+  cache_runlock();
+
+  FILE *f = NULL;
+  if (fopen_s(&f, path, "rb") != 0) return NULL;
+  char *data = malloc((size_t)st.st_size);
+  if (!data) { fclose(f); return NULL; }
+  size_t n = fread(data, 1, (size_t)st.st_size, f);
+  fclose(f);
+
+  cache_wlock();
+  int slot = g_cache_n < CACHE_CAP ? g_cache_n++ : 0; /* evict slot 0 when full */
+  for (int i = 0; i < g_cache_n; i++)
+    if (strcmp(g_cache[i].path, path) == 0) { slot = i; break; }
+  free(g_cache[slot].data);
+  strncpy(g_cache[slot].path, path, sizeof(g_cache[slot].path) - 1);
+  g_cache[slot].data  = data;
+  g_cache[slot].size  = n;
+  g_cache[slot].mtime = mtime;
+  cache_wunlock();
+
+  char *copy = malloc(n);
+  if (copy) { memcpy(copy, data, n); *out_size = n; }
+  return copy;
+}
 
 const char *mime_type(const char *path) {
   static const struct { const char *ext, *type; } map[] = {
@@ -109,27 +180,10 @@ void handle_client(SOCKET client) {
 
   const char *local_path = (strcmp(path, "/") == 0) ? "index.html" : path + 1;
 
-  FILE *f = NULL;
-  if (fopen_s(&f, local_path, "rb") != 0)
+  size_t bytes_read = 0;
+  char *data = cache_get(local_path, &bytes_read);
+  if (!data)
     RESPOND(client, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found");
-
-  fseek(f, 0, SEEK_END);
-  long file_size = ftell(f);
-  rewind(f);
-
-  if (file_size <= 0 || file_size > MAX_FILE_SIZE) {
-    fclose(f);
-    RESPOND(client, "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\nFile too large");
-  }
-
-  char *data = malloc((size_t)file_size);
-  if (!data) {
-    fclose(f);
-    RESPOND(client, "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\nOut of memory");
-  }
-
-  size_t bytes_read = fread(data, 1, (size_t)file_size, f);
-  fclose(f);
 
   char header[256];
   snprintf(header, sizeof(header),
@@ -180,6 +234,8 @@ int main(int argc, char *argv[]) {
     strncpy(serve_dir, argv[2], sizeof(serve_dir) - 1);
     serve_dir[sizeof(serve_dir) - 1] = '\0';
   }
+
+  cache_lock_init();
 
   if (os_chdir(serve_dir) != 0) {
     printf("Failed to change to directory: %s\n", serve_dir);
