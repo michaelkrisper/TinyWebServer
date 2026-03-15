@@ -49,7 +49,6 @@ static CONDITION_VARIABLE g_queue_cond;
 #define THREAD_RET         DWORD WINAPI
 #define THREAD_RET_VAL     0
 
-/* Atomic timestamp: relaxed store/load, no write-lock upgrade needed */
 typedef volatile LONG64 atomic_time_t;
 static inline void atomic_time_store(atomic_time_t *p, time_t v) {
   InterlockedExchange64((LONGLONG volatile *)p, (LONGLONG)v);
@@ -65,6 +64,7 @@ static inline time_t atomic_time_load(const atomic_time_t *p) { return (time_t)*
 #include <stdatomic.h>
 #include <stdint.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #define SOCKET         int
 #define INVALID_SOCKET (-1)
@@ -94,6 +94,8 @@ static pthread_rwlock_t g_lock = PTHREAD_RWLOCK_INITIALIZER;
 #define cache_wlock()     pthread_rwlock_wrlock(&g_lock)
 #define cache_wunlock()   pthread_rwlock_unlock(&g_lock)
 
+/* Queue mutex/cond only needed on non-Linux (Linux uses SO_REUSEPORT, no queue) */
+#ifndef __linux__
 static pthread_mutex_t g_queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_queue_cond  = PTHREAD_COND_INITIALIZER;
 #define queue_mutex_init() ((void)0)
@@ -101,6 +103,8 @@ static pthread_cond_t  g_queue_cond  = PTHREAD_COND_INITIALIZER;
 #define queue_unlock()     pthread_mutex_unlock(&g_queue_mutex)
 #define queue_wait()       pthread_cond_wait(&g_queue_cond, &g_queue_mutex)
 #define queue_signal()     pthread_cond_signal(&g_queue_cond)
+#endif
+
 #define THREAD_RET         void *
 #define THREAD_RET_VAL     NULL
 
@@ -113,6 +117,31 @@ static inline time_t atomic_time_load(const atomic_time_t *p) {
 }
 #endif
 
+/* --- Shared clock: background thread updates g_now every second ---------- */
+static volatile time_t g_now;
+
+static THREAD_RET clock_thread(void *_) {
+  (void)_;
+  for (;;) {
+#ifdef _WIN32
+    Sleep(1000);
+#else
+    sleep(1);
+#endif
+    g_now = time(NULL);
+  }
+  return THREAD_RET_VAL;
+}
+
+static void start_clock(void) {
+#ifdef _WIN32
+  CloseHandle(CreateThread(NULL, 0, (LPTHREAD_START_ROUTINE)clock_thread, NULL, 0, NULL));
+#else
+  pthread_t t; pthread_create(&t, NULL, clock_thread, NULL); pthread_detach(t);
+#endif
+}
+
+/* --- Cache --------------------------------------------------------------- */
 typedef struct {
   char   path[256];
   char  *data;
@@ -130,20 +159,26 @@ static int        g_cache_n;
 
 const char *mime_type(const char *path);
 
+/* Scatter-gather send: header + body in one syscall */
 static void send_response(SOCKET client, const char *header, int header_len,
                            const char *data, size_t size) {
-  send(client, header, header_len, 0);
-  size_t sent = 0;
-  while (sent < size) {
-    int n = send(client, data + sent, (int)(size - sent), 0);
-    if (n <= 0) break;
-    sent += (size_t)n;
-  }
+#ifdef _WIN32
+  WSABUF bufs[2];
+  bufs[0].buf = (CHAR *)header; bufs[0].len = (ULONG)header_len;
+  bufs[1].buf = (CHAR *)data;   bufs[1].len = (ULONG)size;
+  DWORD sent;
+  WSASend(client, bufs, 2, &sent, 0, NULL, NULL);
+#else
+  struct iovec iov[2];
+  iov[0].iov_base = (void *)header; iov[0].iov_len = (size_t)header_len;
+  iov[1].iov_base = (void *)data;   iov[1].iov_len = size;
+  writev(client, iov, 2);
+#endif
 }
 
 /* Serves path to client directly from cache. Returns 1 on success, 0 on error. */
 static int cache_serve(const char *path, SOCKET client, int keep_alive) {
-  time_t now = time(NULL);
+  time_t now = g_now;  /* shared clock — no syscall */
 
   /* Fast path: entry is fresh — skip stat, send under read lock (no copy) */
   cache_rlock();
@@ -175,7 +210,7 @@ static int cache_serve(const char *path, SOCKET client, int keep_alive) {
                     keep_alive ? e->header_ka : e->header_cl,
                     keep_alive ? e->header_ka_len : e->header_cl_len,
                     e->data, e->size);
-      atomic_time_store(&e->last_checked, now);  /* no write-lock upgrade needed */
+      atomic_time_store(&e->last_checked, now);
       cache_runlock();
       return 1;
     }
@@ -190,7 +225,6 @@ static int cache_serve(const char *path, SOCKET client, int keep_alive) {
   size_t n = fread(data, 1, (size_t)st.st_size, f);
   fclose(f);
 
-  /* Pre-build both header variants */
   char hdr_ka[256], hdr_cl[256];
   int hdr_ka_len = snprintf(hdr_ka, sizeof(hdr_ka),
     "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: keep-alive\r\n\r\n",
@@ -244,13 +278,57 @@ const char *mime_type(const char *path) {
   return "application/octet-stream";
 }
 
+/* --- Single-pass request parser ----------------------------------------- */
+/* Returns 0=ok, -403=forbidden, -405=method not allowed.
+   Fills path[] and *keep_alive on success. */
+static int parse_request(const char *buf, char *path, size_t path_cap, int *keep_alive) {
+  if (strncmp(buf, "GET ", 4) != 0) return -405;
+
+  /* Extract path; detect ".." in one scan */
+  const char *p = buf + 4;
+  size_t plen = 0;
+  int dotdot = 0;
+  while (*p && *p != ' ' && *p != '?') {
+    if (*p == '.' && p[1] == '.') dotdot = 1;
+    if (plen < path_cap - 1) path[plen++] = *p;
+    p++;
+  }
+  path[plen] = '\0';
+  if (dotdot) return -403;
+
+  /* Skip query string to reach the HTTP version token */
+  while (*p && *p != ' ') p++;
+  if (*p == ' ') p++;
+  int http10 = (strncmp(p, "HTTP/1.0", 8) == 0);
+
+  /* Skip to end of request line */
+  while (*p && *p != '\n') p++;
+  if (*p) p++;
+
+  /* Scan headers for Connection: (stop at blank line) */
+  int conn_close = 0, conn_ka = 0;
+  while (*p && !(*p == '\r' || *p == '\n')) {
+    if (strncmp(p, "Connection: ", 12) == 0) {
+      p += 12;
+      if      (strncmp(p, "keep-alive", 10) == 0) conn_ka    = 1;
+      else if (strncmp(p, "close",       5) == 0) conn_close = 1;
+    }
+    while (*p && *p != '\n') p++;
+    if (*p) p++;
+  }
+
+  *keep_alive = !conn_close && (!http10 || conn_ka);
+  return 0;
+}
+
+/* --- Connection handler -------------------------------------------------- */
 void handle_client(SOCKET client) {
 #ifdef _WIN32
   DWORD tv = 5000;
 #else
   struct timeval tv = {5, 0};
 #endif
-  setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+  setsockopt(client, SOL_SOCKET,  SO_RCVTIMEO,  (const char *)&tv,  sizeof(tv));
   int nodelay = 1;
   setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (const char *)&nodelay, sizeof(nodelay));
 
@@ -260,29 +338,20 @@ void handle_client(SOCKET client) {
     if (nr <= 0) break;
     buffer[nr] = '\0';
 
-    if (strncmp(buffer, "GET ", 4) != 0) {
+    char path[512];
+    int  keep_alive;
+    int  status = parse_request(buffer, path, sizeof(path), &keep_alive);
+
+    if (status == -405) {
       send(client, "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\nMethod Not Allowed", 73, 0);
       break;
     }
-
-    char path[512] = {0};
-    char *path_end = strchr(buffer + 4, ' ');
-    if (!path_end) break;
-    size_t path_len = (size_t)(path_end - (buffer + 4));
-    if (path_len >= sizeof(path)) path_len = sizeof(path) - 1;
-    strncpy(path, buffer + 4, path_len);
-
-    char *q = strchr(path, '?');
-    if (q) *q = '\0';
-
-    if (strstr(path, "..")) {
+    if (status == -403) {
       send(client, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nForbidden", 55, 0);
       break;
     }
 
-    const char *local_path = (strcmp(path, "/") == 0) ? "index.html" : path + 1;
-    int keep_alive = !strstr(buffer, "Connection: close") &&
-                     (!strstr(buffer, "HTTP/1.0") || !!strstr(buffer, "Connection: keep-alive"));
+    const char *local_path = (path[0] == '/' && path[1] == '\0') ? "index.html" : path + 1;
 
     if (!cache_serve(local_path, client, keep_alive)) {
       send(client, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found", 55, 0);
@@ -294,6 +363,50 @@ void handle_client(SOCKET client) {
   closesocket(client);
 }
 
+/* --- Thread pool --------------------------------------------------------- */
+#ifdef __linux__
+
+/* On Linux: SO_REUSEPORT — each worker owns its socket, no shared queue.
+   The kernel distributes accepted connections across all worker sockets. */
+static THREAD_RET worker_thread(void *arg) {
+  int port = (int)(intptr_t)arg;
+
+  int srv = socket(AF_INET, SOCK_STREAM, 0);
+  if (srv < 0) return THREAD_RET_VAL;
+
+  int opt = 1;
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  setsockopt(srv, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
+
+  struct sockaddr_in addr = {0};
+  addr.sin_family      = AF_INET;
+  addr.sin_addr.s_addr = INADDR_ANY;
+  addr.sin_port        = htons((unsigned short)port);
+
+  if (bind(srv,  (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+      listen(srv, SOMAXCONN) != 0) {
+    close(srv);
+    return THREAD_RET_VAL;
+  }
+
+  for (;;) {
+    int client = accept(srv, NULL, NULL);
+    if (client >= 0) handle_client(client);
+  }
+  return THREAD_RET_VAL;
+}
+
+static void start_pool(int port) {
+  for (int i = 0; i < POOL_SIZE; i++) {
+    pthread_t t;
+    pthread_create(&t, NULL, worker_thread, (void *)(intptr_t)port);
+    pthread_detach(t);
+  }
+}
+
+#else
+
+/* Windows / macOS: queue-based pool with shared accept loop in main() */
 static SOCKET g_queue[QUEUE_CAP];
 static int    g_queue_head, g_queue_tail, g_queue_len;
 
@@ -311,7 +424,21 @@ static THREAD_RET worker_thread(void *_) {
   return THREAD_RET_VAL;
 }
 
-static void start_pool(void) {
+static void enqueue_client(SOCKET s) {
+  queue_lock();
+  if (g_queue_len < QUEUE_CAP) {
+    g_queue[g_queue_tail] = s;
+    g_queue_tail = (g_queue_tail + 1) % QUEUE_CAP;
+    g_queue_len++;
+    queue_signal();
+  } else {
+    closesocket(s);
+  }
+  queue_unlock();
+}
+
+static void start_pool(int port) {
+  (void)port;
   queue_mutex_init();
   for (int i = 0; i < POOL_SIZE; i++) {
 #ifdef _WIN32
@@ -322,19 +449,9 @@ static void start_pool(void) {
   }
 }
 
-static void enqueue_client(SOCKET s) {
-  queue_lock();
-  if (g_queue_len < QUEUE_CAP) {
-    g_queue[g_queue_tail] = s;
-    g_queue_tail = (g_queue_tail + 1) % QUEUE_CAP;
-    g_queue_len++;
-    queue_signal();
-  } else {
-    closesocket(s); /* queue full, reject */
-  }
-  queue_unlock();
-}
+#endif  /* __linux__ */
 
+/* --- main --------------------------------------------------------------- */
 int main(int argc, char *argv[]) {
   int port = DEFAULT_PORT;
   char serve_dir[512];
@@ -353,7 +470,8 @@ int main(int argc, char *argv[]) {
   }
 
   cache_lock_init();
-  start_pool();
+  g_now = time(NULL);
+  start_clock();
 
   if (os_chdir(serve_dir) != 0) {
     printf("Failed to change to directory: %s\n", serve_dir);
@@ -367,6 +485,16 @@ int main(int argc, char *argv[]) {
   signal(SIGPIPE, SIG_IGN);
 #endif
 
+  start_pool(port);
+
+  printf("Serving files from: %s\n", serve_dir);
+  printf("Tiny C Web Server listening on http://localhost:%d\n", port);
+  printf("Press Ctrl+C to exit.\n");
+
+#ifdef __linux__
+  /* Workers own their sockets; main thread just waits for a signal */
+  for (;;) pause();
+#else
   SOCKET server = socket(AF_INET, SOCK_STREAM, 0);
   if (server == INVALID_SOCKET) return 1;
 
@@ -374,24 +502,20 @@ int main(int argc, char *argv[]) {
   setsockopt(server, SOL_SOCKET, SO_REUSEADDR, (const char *)&opt, sizeof(opt));
 
   struct sockaddr_in addr = {0};
-  addr.sin_family = AF_INET;
+  addr.sin_family      = AF_INET;
   addr.sin_addr.s_addr = INADDR_ANY;
-  addr.sin_port = htons((unsigned short)port);
+  addr.sin_port        = htons((unsigned short)port);
 
   if (bind(server, (struct sockaddr *)&addr, sizeof(addr)) == SOCKET_ERROR) {
     printf("Bind failed. Port %d maybe in use?\n", port);
     return 1;
   }
-
   if (listen(server, SOMAXCONN) == SOCKET_ERROR) return 1;
-
-  printf("Serving files from: %s\n", serve_dir);
-  printf("Tiny C Web Server listening on http://localhost:%d\n", port);
-  printf("Press Ctrl+C to exit.\n");
 
   while (1) {
     SOCKET client = accept(server, NULL, NULL);
     if (client != INVALID_SOCKET)
       enqueue_client(client);
   }
+#endif
 }
