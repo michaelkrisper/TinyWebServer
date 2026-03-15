@@ -12,8 +12,10 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+      - name: Install liburing
+        run: sudo apt-get install -y liburing-dev
       - name: Build Linux Binary
-        run: gcc -O3 -o server-linux server.c -lpthread
+        run: gcc -O3 -o server-linux server.c -lpthread -luring
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:

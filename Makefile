@@ -3,6 +3,13 @@
 CC ?= gcc
 CFLAGS = -O3 -Wall -Wextra -pthread
 LDFLAGS = -lpthread
+
+# Link liburing on Linux if available
+ifeq ($(shell uname -s 2>/dev/null),Linux)
+  ifneq ($(wildcard /usr/include/liburing.h),)
+    LDFLAGS += -luring
+  endif
+endif
 TARGET = server
 
 .PHONY: all clean bench test
