@@ -7,7 +7,8 @@
 #define DEFAULT_PORT  80
 #define MAX_REQ       2048
 #define MAX_FILE_SIZE (10 * 1024 * 1024)
-#define CACHE_CAP     64
+#define CACHE_CAP            64
+#define MTIME_CHECK_INTERVAL  1   /* seconds between mtime re-checks */
 #define POOL_SIZE     32
 #define QUEUE_CAP     256
 
@@ -100,50 +101,87 @@ typedef struct {
   char  *data;
   size_t size;
   time_t mtime;
+  time_t last_checked;
 } CacheEntry;
 
 static CacheEntry g_cache[CACHE_CAP];
 static int        g_cache_n;
 
-/* Returns a malloc'd copy of the file data, or NULL on error. */
-static char *cache_get(const char *path, size_t *out_size) {
-  os_stat_t st;
-  if (os_stat(path, &st) != 0) return NULL;
-  if (st.st_size <= 0 || st.st_size > MAX_FILE_SIZE) return NULL;
-  time_t mtime = st.st_mtime;
+const char *mime_type(const char *path);
 
+static void send_response(SOCKET client, const char *data, size_t size,
+                           const char *path, int keep_alive) {
+  char header[256];
+  snprintf(header, sizeof(header),
+    "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: %s\r\n\r\n",
+    mime_type(path), (unsigned long)size, keep_alive ? "keep-alive" : "close");
+  send(client, header, (int)strlen(header), 0);
+  size_t sent = 0;
+  while (sent < size) {
+    int n = send(client, data + sent, (int)(size - sent), 0);
+    if (n <= 0) break;
+    sent += (size_t)n;
+  }
+}
+
+/* Serves path to client directly from cache. Returns 1 on success, 0 on error. */
+static int cache_serve(const char *path, SOCKET client, int keep_alive) {
+  time_t now = time(NULL);
+
+  /* Fast path: entry is fresh — skip stat, send under read lock (no copy) */
   cache_rlock();
   for (int i = 0; i < g_cache_n; i++) {
-    if (strcmp(g_cache[i].path, path) == 0 && g_cache[i].mtime == mtime) {
-      char *copy = malloc(g_cache[i].size);
-      if (copy) { memcpy(copy, g_cache[i].data, g_cache[i].size); *out_size = g_cache[i].size; }
+    if (strcmp(g_cache[i].path, path) == 0 &&
+        now - g_cache[i].last_checked < MTIME_CHECK_INTERVAL) {
+      send_response(client, g_cache[i].data, g_cache[i].size, path, keep_alive);
       cache_runlock();
-      return copy;
+      return 1;
     }
   }
   cache_runlock();
 
+  /* Slow path: stat to detect changes */
+  os_stat_t st;
+  if (os_stat(path, &st) != 0) return 0;
+  if (st.st_size <= 0 || st.st_size > MAX_FILE_SIZE) return 0;
+
+  /* Cached entry still valid (same mtime)? Send and refresh last_checked. */
+  cache_rlock();
+  for (int i = 0; i < g_cache_n; i++) {
+    if (strcmp(g_cache[i].path, path) == 0 && g_cache[i].mtime == st.st_mtime) {
+      send_response(client, g_cache[i].data, g_cache[i].size, path, keep_alive);
+      cache_runlock();
+      cache_wlock();
+      for (int j = 0; j < g_cache_n; j++)
+        if (strcmp(g_cache[j].path, path) == 0) { g_cache[j].last_checked = now; break; }
+      cache_wunlock();
+      return 1;
+    }
+  }
+  cache_runlock();
+
+  /* Miss or stale: load from disk */
   FILE *f = NULL;
-  if (fopen_s(&f, path, "rb") != 0) return NULL;
+  if (fopen_s(&f, path, "rb") != 0) return 0;
   char *data = malloc((size_t)st.st_size);
-  if (!data) { fclose(f); return NULL; }
+  if (!data) { fclose(f); return 0; }
   size_t n = fread(data, 1, (size_t)st.st_size, f);
   fclose(f);
 
+  send_response(client, data, n, path, keep_alive);
+
   cache_wlock();
-  int slot = g_cache_n < CACHE_CAP ? g_cache_n++ : 0; /* evict slot 0 when full */
+  int slot = g_cache_n < CACHE_CAP ? g_cache_n++ : 0;
   for (int i = 0; i < g_cache_n; i++)
     if (strcmp(g_cache[i].path, path) == 0) { slot = i; break; }
   free(g_cache[slot].data);
   strncpy(g_cache[slot].path, path, sizeof(g_cache[slot].path) - 1);
-  g_cache[slot].data  = data;
-  g_cache[slot].size  = n;
-  g_cache[slot].mtime = mtime;
+  g_cache[slot].data         = data;
+  g_cache[slot].size         = n;
+  g_cache[slot].mtime        = st.st_mtime;
+  g_cache[slot].last_checked = now;
   cache_wunlock();
-
-  char *copy = malloc(n);
-  if (copy) { memcpy(copy, data, n); *out_size = n; }
-  return copy;
+  return 1;
 }
 
 const char *mime_type(const char *path) {
@@ -169,56 +207,50 @@ const char *mime_type(const char *path) {
   return "application/octet-stream";
 }
 
-#define RESPOND(c, msg) do { send(c, msg, (int)strlen(msg), 0); closesocket(c); return; } while(0)
-
 void handle_client(SOCKET client) {
 #ifdef _WIN32
-  DWORD tv = 2000;
+  DWORD tv = 5000;
 #else
-  struct timeval tv = {2, 0};
+  struct timeval tv = {5, 0};
 #endif
   setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
 
-  char buffer[MAX_REQ] = {0};
-  int received = recv(client, buffer, sizeof(buffer) - 1, 0);
-  if (received <= 0) { closesocket(client); return; }
-  buffer[received] = '\0';
+  char buffer[MAX_REQ];
+  for (;;) {
+    memset(buffer, 0, sizeof(buffer));
+    if (recv(client, buffer, sizeof(buffer) - 1, 0) <= 0) break;
 
-  if (strncmp(buffer, "GET ", 4) != 0)
-    RESPOND(client, "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\nMethod Not Allowed");
+    if (strncmp(buffer, "GET ", 4) != 0) {
+      send(client, "HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\nMethod Not Allowed", 73, 0);
+      break;
+    }
 
-  char path[512] = {0};
-  char *path_end = strchr(buffer + 4, ' ');
-  if (!path_end) { closesocket(client); return; }
-  size_t path_len = (size_t)(path_end - (buffer + 4));
-  if (path_len >= sizeof(path)) path_len = sizeof(path) - 1;
-  strncpy(path, buffer + 4, path_len);
+    char path[512] = {0};
+    char *path_end = strchr(buffer + 4, ' ');
+    if (!path_end) break;
+    size_t path_len = (size_t)(path_end - (buffer + 4));
+    if (path_len >= sizeof(path)) path_len = sizeof(path) - 1;
+    strncpy(path, buffer + 4, path_len);
 
-  char *q = strchr(path, '?');
-  if (q) *q = '\0';
+    char *q = strchr(path, '?');
+    if (q) *q = '\0';
 
-  if (strstr(path, ".."))
-    RESPOND(client, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nForbidden");
+    if (strstr(path, "..")) {
+      send(client, "HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\nForbidden", 55, 0);
+      break;
+    }
 
-  const char *local_path = (strcmp(path, "/") == 0) ? "index.html" : path + 1;
+    const char *local_path = (strcmp(path, "/") == 0) ? "index.html" : path + 1;
+    int keep_alive = !strstr(buffer, "Connection: close") &&
+                     (!strstr(buffer, "HTTP/1.0") || !!strstr(buffer, "Connection: keep-alive"));
 
-  size_t bytes_read = 0;
-  char *data = cache_get(local_path, &bytes_read);
-  if (!data)
-    RESPOND(client, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found");
+    if (!cache_serve(local_path, client, keep_alive)) {
+      send(client, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found", 55, 0);
+      break;
+    }
 
-  char header[256];
-  snprintf(header, sizeof(header),
-           "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %lu\r\nConnection: close\r\n\r\n",
-           mime_type(local_path), (unsigned long)bytes_read);
-  send(client, header, (int)strlen(header), 0);
-  size_t sent = 0;
-  while (sent < bytes_read) {
-    int n = send(client, data + sent, (int)(bytes_read - sent), 0);
-    if (n <= 0) break;
-    sent += (size_t)n;
+    if (!keep_alive) break;
   }
-  free(data);
   closesocket(client);
 }
 
